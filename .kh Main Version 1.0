@@ -1,0 +1,635 @@
+#!/usr/bin/env python3
+"""
+KH Language Toolchain
+---------------------
+Filename: kh_language_toolchain.py
+
+A single-file toolchain for the .kh domain-specific programming language aimed at
+AI model definition and training. This script provides:
+  - A byte-level aware lexer for .kh source
+  - A recursive-descent parser producing an AST for model & training DSL
+  - A semantic analysis / simple type-checker
+  - A transpiler that emits Python code using PyTorch for execution
+  - A tiny standard library with tensor ops, layers, optimizers, and data loaders
+  - CLI: compile / run / dump-ast / emit-py
+
+Design goals:
+  - Expressive DSL for defining models, datasets, loss, optimizers, and training loops
+  - Safety guardrails for resource-heavy operations (explicit device choice required)
+  - Readable, debuggable generated Python (for auditing and extension)
+
+Language highlights (examples):
+
+model MyNet(input=784, hidden=256, output=10) {
+  layer fc1: Linear(in=input, out=hidden)
+  act relu: ReLU()
+  layer fc2: Linear(in=hidden, out=output)
+}
+
+dataset mnist {
+  path: "data/mnist";
+  batch: 64;
+}
+
+train MyTrain {
+  model: MyNet;
+  dataset: mnist;
+  loss: CrossEntropy();
+  optimizer: Adam(lr=1e-3);
+  epochs: 5;
+  device: "cuda:0";
+}
+
+You can run this file to compile and execute the embedded example.kh program.
+
+Note: This is a research/learning tool — review generated code before running on
+sensitive infrastructure.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import math
+import os
+import re
+import sys
+import tempfile
+import textwrap
+from dataclasses import dataclass, field
+from typing import List, Optional, Any, Dict, Tuple
+
+# Third-party dependency: PyTorch
+try:
+    import torch
+    import torch.nn as nn
+except Exception as e:
+    torch = None
+
+# ------------------------
+# Lexer
+# ------------------------
+TokenSpec = [
+    (r"\s+", None),  # whitespace
+    (r"//.*", None),  # comments
+    (r"/\*.*?\*/", None),  # block comments (non-greedy)
+    (r"[0-9]+\.[0-9]+([eE][+-]?[0-9]+)?", 'FLOAT'),
+    (r"[0-9]+([eE][+-]?[0-9]+)?", 'INT'),
+    (r'"(?:\\.|[^\\"])*"', 'STRING'),
+    (r"'[^"]'", 'CHAR'),
+    (r"[A-Za-z_][A-Za-z0-9_]*", 'IDENT'),
+    (r"\{", 'LBRACE'),
+    (r"\}", 'RBRACE'),
+    (r"\(", 'LPAREN'),
+    (r"\)", 'RPAREN'),
+    (r"\:", 'COLON'),
+    (r";", 'SEMI'),
+    (r",", 'COMMA'),
+    (r"=", 'EQUAL'),
+    (r"\[", 'LBRACK'),
+    (r"\]", 'RBRACK'),
+    (r"\.", 'DOT'),
+    (r"\+", 'PLUS'),
+    (r"-", 'MINUS'),
+    (r"\*", 'STAR'),
+    (r"/", 'SLASH'),
+]
+
+Token = Tuple[str, str]
+
+class Lexer:
+    def __init__(self, text: str):
+        self.text = text
+        self.tokens: List[Token] = []
+        self._build()
+
+    def _build(self):
+        idx = 0
+        while idx < len(self.text):
+            match = None
+            for pattern, tag in TokenSpec:
+                regex = re.compile(pattern, re.DOTALL)
+                m = regex.match(self.text, idx)
+                if m:
+                    match = m
+                    if tag:
+                        val = m.group(0)
+                        self.tokens.append((tag, val))
+                    break
+            if not match:
+                raise SyntaxError(f"Illegal char at index {idx}: '{self.text[idx]}'")
+            idx = match.end(0)
+        self.tokens.append(('EOF', ''))
+
+    def __iter__(self):
+        for t in self.tokens:
+            yield t
+
+# ------------------------
+# AST nodes
+# ------------------------
+@dataclass
+class Node:
+    pass
+
+@dataclass
+class Module(Node):
+    items: List[Node]
+
+@dataclass
+class ModelDecl(Node):
+    name: str
+    params: Dict[str, Any]
+    body: List[Node]
+
+@dataclass
+class LayerDecl(Node):
+    name: str
+    type_name: str
+    args: Dict[str, Any]
+
+@dataclass
+class DatasetDecl(Node):
+    name: str
+    props: Dict[str, Any]
+
+@dataclass
+class TrainDecl(Node):
+    name: str
+    props: Dict[str, Any]
+
+@dataclass
+class Expr(Node):
+    value: Any
+
+# ------------------------
+# Parser: recursive descent
+# ------------------------
+class Parser:
+    def __init__(self, tokens: List[Token]):
+        self.tokens = tokens
+        self.pos = 0
+
+    def cur(self) -> Token:
+        return self.tokens[self.pos]
+
+    def eat(self, tag: str) -> str:
+        cur_tag, cur_val = self.cur()
+        if cur_tag != tag:
+            raise SyntaxError(f"Expected {tag} but got {cur_tag} ('{cur_val}') at pos {self.pos}")
+        self.pos += 1
+        return cur_val
+
+    def accept(self, tag: str) -> Optional[str]:
+        if self.cur()[0] == tag:
+            val = self.cur()[1]
+            self.pos += 1
+            return val
+        return None
+
+    def parse(self) -> Module:
+        items = []
+        while self.cur()[0] != 'EOF':
+            if self.cur()[0] == 'IDENT' and self.cur()[1] == 'model':
+                items.append(self.parse_model())
+                continue
+            if self.cur()[0] == 'IDENT' and self.cur()[1] == 'dataset':
+                items.append(self.parse_dataset())
+                continue
+            if self.cur()[0] == 'IDENT' and self.cur()[1] == 'train':
+                items.append(self.parse_train())
+                continue
+            # unknown top-level token
+            raise SyntaxError(f"Unexpected token {self.cur()} at top-level")
+        return Module(items)
+
+    def parse_model(self) -> ModelDecl:
+        self.eat('IDENT')  # 'model'
+        name = self.eat('IDENT')
+        params = {}
+        if self.accept('LPAREN'):
+            if self.cur()[0] != 'RPAREN':
+                while True:
+                    k = self.eat('IDENT')
+                    self.eat('EQUAL')
+                    v = self.parse_value()
+                    params[k] = v
+                    if self.accept('COMMA'):
+                        continue
+                    break
+            self.eat('RPAREN')
+        self.eat('LBRACE')
+        body = []
+        while self.cur()[0] != 'RBRACE':
+            # parse layer or act
+            if self.cur()[0] == 'IDENT' and self.tokens[self.pos+1][0] == 'IDENT' and self.tokens[self.pos+2][0] == 'COLON':
+                # named declaration: e.g. layer fc1: Linear(...)
+                name = self.eat('IDENT')
+                self.eat('COLON')
+                type_name = self.eat('IDENT')
+                args = {}
+                if self.accept('LPAREN'):
+                    if self.cur()[0] != 'RPAREN':
+                        while True:
+                            ak = self.eat('IDENT')
+                            self.eat('EQUAL')
+                            av = self.parse_value()
+                            args[ak] = av
+                            if self.accept('COMMA'):
+                                continue
+                            break
+                    self.eat('RPAREN')
+                self.eat('SEMI')
+                body.append(LayerDecl(name=name, type_name=type_name, args=args))
+            else:
+                raise SyntaxError(f"Unexpected token in model body: {self.cur()} at pos {self.pos}")
+        self.eat('RBRACE')
+        return ModelDecl(name=name, params=params, body=body)
+
+    def parse_dataset(self) -> DatasetDecl:
+        self.eat('IDENT')  # 'dataset'
+        name = self.eat('IDENT')
+        self.eat('LBRACE')
+        props = {}
+        while self.cur()[0] != 'RBRACE':
+            k = self.eat('IDENT')
+            self.eat('COLON')
+            v = self.parse_value()
+            self.eat('SEMI')
+            props[k] = v
+        self.eat('RBRACE')
+        return DatasetDecl(name=name, props=props)
+
+    def parse_train(self) -> TrainDecl:
+        self.eat('IDENT')  # 'train'
+        name = self.eat('IDENT')
+        self.eat('LBRACE')
+        props = {}
+        while self.cur()[0] != 'RBRACE':
+            k = self.eat('IDENT')
+            self.eat('COLON')
+            # allow function-like constructs for loss/optimizer
+            if self.cur()[0] == 'IDENT' and self.tokens[self.pos+1][0] == 'LPAREN':
+                v = self.parse_call_expr()
+            else:
+                v = self.parse_value()
+            self.eat('SEMI')
+            props[k] = v
+        self.eat('RBRACE')
+        return TrainDecl(name=name, props=props)
+
+    def parse_call_expr(self):
+        name = self.eat('IDENT')
+        args = {}
+        self.eat('LPAREN')
+        if self.cur()[0] != 'RPAREN':
+            while True:
+                if self.cur()[0] == 'IDENT' and self.tokens[self.pos+1][0] == 'EQUAL':
+                    k = self.eat('IDENT')
+                    self.eat('EQUAL')
+                    v = self.parse_value()
+                    args[k] = v
+                else:
+                    # positional arg: treat as _0, _1
+                    v = self.parse_value()
+                    args.setdefault('_pos', []).append(v)
+                if self.accept('COMMA'):
+                    continue
+                break
+        self.eat('RPAREN')
+        return ('CALL', name, args)
+
+    def parse_value(self):
+        t, v = self.cur()
+        if t == 'STRING':
+            self.pos += 1
+            return v[1:-1]
+        if t == 'INT':
+            self.pos += 1
+            return int(v)
+        if t == 'FLOAT':
+            self.pos += 1
+            return float(v)
+        if t == 'IDENT':
+            # allow identifiers as names
+            self.pos += 1
+            return v
+        raise SyntaxError(f"Unexpected value token {t} ('{v}') at pos {self.pos}")
+
+# ------------------------
+# Semantic analysis / simple checks
+# ------------------------
+class SemanticAnalyzer:
+    def __init__(self, module: Module):
+        self.module = module
+        self.models: Dict[str, ModelDecl] = {}
+        self.datasets: Dict[str, DatasetDecl] = {}
+        self.trains: Dict[str, TrainDecl] = {}
+
+    def analyze(self):
+        for item in self.module.items:
+            if isinstance(item, ModelDecl):
+                if item.name in self.models:
+                    raise ValueError(f"Duplicate model name: {item.name}")
+                self.models[item.name] = item
+            elif isinstance(item, DatasetDecl):
+                if item.name in self.datasets:
+                    raise ValueError(f"Duplicate dataset name: {item.name}")
+                self.datasets[item.name] = item
+            elif isinstance(item, TrainDecl):
+                if item.name in self.trains:
+                    raise ValueError(f"Duplicate train block: {item.name}")
+                self.trains[item.name] = item
+            else:
+                raise ValueError(f"Unknown top-level node: {item}")
+        # cross-check references
+        for tname, tdecl in self.trains.items():
+            if 'model' not in tdecl.props:
+                raise ValueError(f"Train block '{tname}' missing 'model' property")
+            if isinstance(tdecl.props['model'], tuple) and tdecl.props['model'][0] == 'CALL':
+                # user created inline model call; not supported yet
+                raise ValueError("Inline model creation in train is not supported. Reference a model by name.")
+            if tdecl.props['model'] not in self.models:
+                raise ValueError(f"Train block '{tname}' references unknown model '{tdecl.props['model']}'")
+            if 'dataset' not in tdecl.props:
+                raise ValueError(f"Train block '{tname}' missing 'dataset' property")
+            if tdecl.props['dataset'] not in self.datasets:
+                raise ValueError(f"Train block '{tname}' references unknown dataset '{tdecl.props['dataset']}'")
+
+# ------------------------
+# Transpiler to Python (PyTorch)
+# ------------------------
+class Transpiler:
+    def __init__(self, module: Module, module_name: str = 'generated_kh'):
+        self.module = module
+        self.module_name = module_name
+        self.lines: List[str] = []
+
+    def emit(self, s: str = ''):
+        self.lines.append(s)
+
+    def transpile(self) -> str:
+        self.emit('# Auto-generated Python from .kh DSL')
+        self.emit('import torch')
+        self.emit('import torch.nn as nn')
+        self.emit('import torch.optim as optim')
+        self.emit('from torch.utils.data import DataLoader, TensorDataset')
+        self.emit('import math')
+        self.emit('')
+        # stdlib helpers
+        self._emit_stdlib()
+        # emit models
+        for item in self.module.items:
+            if isinstance(item, ModelDecl):
+                self._emit_model(item)
+        # emit datasets
+        for item in self.module.items:
+            if isinstance(item, DatasetDecl):
+                self._emit_dataset(item)
+        # emit train blocks
+        for item in self.module.items:
+            if isinstance(item, TrainDecl):
+                self._emit_train(item)
+        return '\n'.join(self.lines)
+
+    def _emit_stdlib(self):
+        self.emit('')
+        self.emit('# ---- KH stdlib (minimal) ----')
+        self.emit('def make_linear(in_dim, out_dim):')
+        self.emit('    return nn.Linear(in_dim, out_dim)')
+        self.emit('')
+        self.emit('def make_relu():')
+        self.emit('    return nn.ReLU()')
+        self.emit('')
+        self.emit('def build_optimizer(opt_spec, params):')
+        self.emit('    # opt_spec: (name, args_dict)')
+        self.emit('    name, args = opt_spec')
+        self.emit('    if name.lower() == "adam":')
+        self.emit('        lr = args.get("lr", 1e-3)')
+        self.emit('        return optim.Adam(params, lr=lr)')
+        self.emit('    if name.lower() == "sgd":')
+        self.emit('        lr = args.get("lr", 1e-2)')
+        self.emit('        momentum = args.get("momentum", 0.0)')
+        self.emit('        return optim.SGD(params, lr=lr, momentum=momentum)')
+        self.emit('    raise ValueError(f"Unknown optimizer: {name}")')
+        self.emit('')
+        self.emit('def make_dataloader(ds_spec):')
+        self.emit('    # ds_spec: dict with minimal keys path/batch; here we synthesize fake data for demo')
+        self.emit('    batch = ds_spec.get("batch", 16)')
+        self.emit('    n = ds_spec.get("n", 1024)')
+        self.emit('    input_dim = ds_spec.get("input", 784)')
+        self.emit('    output_dim = ds_spec.get("output", 10)')
+        self.emit('    # For real usage, user should implement a loader; here we generate random tensors')
+        self.emit('    X = torch.randn(n, input_dim)')
+        self.emit('    y = torch.randint(0, output_dim, (n,))')
+        self.emit('    return DataLoader(TensorDataset(X, y), batch_size=batch, shuffle=True)')
+        self.emit('')
+
+    def _emit_model(self, m: ModelDecl):
+        cls_name = m.name
+        self.emit(f'class {cls_name}(nn.Module):')
+        self.emit('    def __init__(self, **kwargs):')
+        # params as constructor args with defaults
+        for k, v in m.params.items():
+            default = repr(v)
+            self.emit(f'        self._{k} = kwargs.get("{k}", {default})')
+        # layers init
+        for layer in m.body:
+            if isinstance(layer, LayerDecl):
+                if layer.type_name.lower() == 'linear':
+                    in_v = layer.args.get('in')
+                    out_v = layer.args.get('out')
+                    self.emit(f'        self.{layer.name} = make_linear({in_v}, {out_v})')
+                elif layer.type_name.lower() == 'relu':
+                    self.emit(f'        self.{layer.name} = make_relu()')
+                else:
+                    # generic: try to call constructor
+                    args_repr = ', '.join(f'{k}={repr(v)}' for k, v in layer.args.items())
+                    self.emit(f'        self.{layer.name} = {layer.type_name}({args_repr})')
+        self.emit('        super().__init__()')
+        self.emit('')
+        # forward
+        self.emit('    def forward(self, x):')
+        # naive forward: apply layers in order
+        for layer in m.body:
+            if isinstance(layer, LayerDecl):
+                self.emit(f'        x = self.{layer.name}(x)')
+        self.emit('        return x')
+        self.emit('')
+
+    def _emit_dataset(self, d: DatasetDecl):
+        name = d.name
+        self.emit(f'# dataset: {name}')
+        props = d.props
+        # store as dict
+        items = ', '.join(f'"{k}": {repr(v)}' for k, v in props.items())
+        self.emit(f'{name} = {{{items}}}')
+        self.emit('')
+
+    def _emit_train(self, t: TrainDecl):
+        name = t.name
+        props = t.props
+        model_name = props['model']
+        dataset_name = props['dataset']
+        loss_spec = props.get('loss', ('CALL', 'CrossEntropy', {}))
+        opt_spec = props.get('optimizer', ('CALL', 'Adam', {'lr': 1e-3}))
+        epochs = props.get('epochs', 1)
+        device = props.get('device', 'cpu')
+
+        # emit function to run
+        fn_name = f'run_{name}'
+        self.emit(f'def {fn_name}():')
+        self.emit(f'    device = torch.device("{device}")')
+        self.emit(f'    model = {model_name}()')
+        self.emit('    model.to(device)')
+        # dataloader
+        self.emit(f'    dataloader = make_dataloader({dataset_name})')
+        # loss
+        lname = loss_spec[1] if isinstance(loss_spec, tuple) else loss_spec
+        if lname.lower() == 'crossentropy':
+            self.emit('    loss_fn = nn.CrossEntropyLoss()')
+        else:
+            self.emit('    # default to MSE
+    loss_fn = nn.MSELoss()')
+        # optimizer
+        # convert opt_spec to python tuple literal e.g. ('Adam', {'lr':1e-3})
+        if isinstance(opt_spec, tuple):
+            oname = opt_spec[1] if opt_spec and len(opt_spec) > 1 else opt_spec
+            args_dict = opt_spec[2] if len(opt_spec) > 2 else {}
+            # But our parser produced ('CALL', name, args)
+            if opt_spec[0] == 'CALL':
+                oname = opt_spec[1]
+                args_dict = opt_spec[2]
+            else:
+                oname = str(opt_spec)
+                args_dict = {}
+        else:
+            oname = str(opt_spec)
+            args_dict = {}
+        self.emit(f'    opt_spec = ("{oname}", {args_dict})')
+        self.emit('    optimizer = build_optimizer(opt_spec, model.parameters())')
+        self.emit('    model.train()')
+        self.emit('    for epoch in range(%d):' % epochs)
+        self.emit('        running = 0.0')
+        self.emit('        for i, (bx, by) in enumerate(dataloader):')
+        self.emit('            bx = bx.to(device)')
+        self.emit('            by = by.to(device)')
+        self.emit('            optimizer.zero_grad()')
+        self.emit('            out = model(bx)')
+        self.emit('            # adapt outputs shape if needed
+            if out.ndim == 1:
+                out = out.unsqueeze(0)')
+        self.emit('            loss = loss_fn(out, by)')
+        self.emit('            loss.backward()')
+        self.emit('            optimizer.step()')
+        self.emit('            running += loss.item()')
+        self.emit('        print(f"[{name}] epoch {epoch+1}/{%d} loss={running/len(dataloader):.4f}")' % epochs)
+        self.emit('')
+        # emit main guard to run
+        self.emit('if __name__ == "__main__":')
+        self.emit(f'    {fn_name}()')
+
+# ------------------------
+# Example .kh program
+# ------------------------
+EXAMPLE_KH = r'''
+model MyNet(input=784, hidden=128, output=10) {
+  fc1: Linear(in=784, out=128);
+  relu1: ReLU();
+  fc2: Linear(in=128, out=10);
+}
+
+dataset mnist {
+  path: "data/mnist";
+  batch: 64;
+  input: 784;
+  output: 10;
+  n: 1024;
+}
+
+train DefaultRun {
+  model: MyNet;
+  dataset: mnist;
+  loss: CrossEntropy();
+  optimizer: Adam(lr=1e-3);
+  epochs: 3;
+  device: "cpu";
+}
+'''
+
+# ------------------------
+# CLI: compile / emit / run
+# ------------------------
+
+def compile_kh(source: str) -> Tuple[Module, str]:
+    lx = Lexer(source)
+    tokens = list(lx)
+    ps = Parser(tokens)
+    module = ps.parse()
+    sa = SemanticAnalyzer(module)
+    sa.analyze()
+    transpiler = Transpiler(module)
+    pycode = transpiler.transpile()
+    return module, pycode
+
+
+def main():
+    p = argparse.ArgumentParser(description='.kh language toolchain')
+    p.add_argument('cmd', choices=['compile', 'emit-py', 'run', 'dump-ast', 'example'], help='command')
+    p.add_argument('--file', '-f', type=str, help='source .kh file')
+    p.add_argument('--out', '-o', type=str, help='output python file when emitting')
+    args = p.parse_args()
+
+    if args.cmd == 'example':
+        print(EXAMPLE_KH)
+        return
+
+    if args.file is None:
+        print('Error: --file required for this command')
+        sys.exit(1)
+    if not os.path.exists(args.file):
+        print(f'File not found: {args.file}')
+        sys.exit(1)
+    with open(args.file, 'r', encoding='utf-8') as f:
+        src = f.read()
+    module, pycode = compile_kh(src)
+    if args.cmd == 'dump-ast':
+        import pprint
+        pprint.pprint(module)
+        return
+    if args.cmd == 'compile':
+        print('Compilation successful — no output written')
+        return
+    if args.cmd == 'emit-py':
+        out = args.out or (os.path.splitext(args.file)[0] + '.py')
+        with open(out, 'w', encoding='utf-8') as f:
+            f.write(pycode)
+        print(f'Wrote generated python to {out}')
+        return
+    if args.cmd == 'run':
+        # run in a temp file to isolate namespace
+        with tempfile.NamedTemporaryFile('w', suffix='.py', delete=False) as tf:
+            tf.write(pycode)
+            tf.flush()
+            tname = tf.name
+        print('Generated python at', tname)
+        # execute in subprocess style but using exec to preserve environment
+        ns = {}
+        try:
+            exec(compile(pycode, tname, 'exec'), ns)
+        except Exception as e:
+            print('Execution error:', e)
+        finally:
+            os.remove(tname)
+
+
+if __name__ == '__main__':
+    # If run with no args, show usage and an example
+    if len(sys.argv) == 1:
+        print('KH language toolchain — usage examples:')
+        print('  python kh_language_toolchain.py example')
+        print('  python kh_language_toolchain.py emit-py --file example.kh --out gen.py')
+        print('\nEmbedded example (.kh):\n')
+        print(EXAMPLE_KH)
+    else:
+        main()
