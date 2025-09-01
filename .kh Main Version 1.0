@@ -358,7 +358,7 @@ class SemanticAnalyzer:
                 raise ValueError(f"Train block '{tname}' references unknown dataset '{tdecl.props['dataset']}'")
 
 # ------------------------
-# Transpiler to Python (PyTorch)
+# Transpiler to Python (PyTorch) & more
 # ------------------------
 class Transpiler:
     def __init__(self, module: Module, module_name: str = 'generated_kh'):
@@ -370,7 +370,7 @@ class Transpiler:
         self.lines.append(s)
 
     def transpile(self) -> str:
-        self.emit('# Auto-generated Python from .kh DSL')
+        self.emit('# Auto-generated Python from .khLP DSL')
         self.emit('import torch')
         self.emit('import torch.nn as nn')
         self.emit('import torch.optim as optim')
