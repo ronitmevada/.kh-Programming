@@ -1,0 +1,11 @@
+// examples/hello.kh
+pub fn greet(name: String) -> String {
+return "Hello ${name}!";
+}
+
+
+pub fn main() -> Int {
+let s: String = greet("world".to_string());
+println(s);
+return 0;
+}
