@@ -1,0 +1,28 @@
+# Build output
+/dist
+/build
+/out
+
+# Bytecode / caches
+*.kho         # compiled .kh object
+.khc_cache/
+
+# Tools
+.vscode/
+.idea/
+
+# Node modules (if any tooling)
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Python envs
+venv/
+
+# Secret keys
+.env
