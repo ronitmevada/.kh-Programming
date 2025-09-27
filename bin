@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# khc - tiny CLI stub for .kh language (prototype)
+set -euo pipefail
+cmd="$1" || cmd="help"
+shift || true
+case "$cmd" in
+run)
+file="$1"
+echo "[khc] running (interpreted) $file"
+# naive interpreter stub: look for a top-level `main` that prints
+if [[ -f "$file" ]]; then
+sed -n '1,200p' "$file"
+else
+echo "file not found: $file" >&2
+exit 2
+fi
+;;
+build)
+echo "[khc] build mode: compiling to .kho (stub)"
+;;
+new)
+echo "[khc] creating new project: $1"
+;;
+fmt)
+echo "[khc] format check (stub)"
+;;
+test)
+echo "[khc] running tests (stub)"
+;;
+help|--help|-h)
+echo "khc — .kh compiler/interpreter (stub)"
+echo "Usage: khc <command> [args]"
+echo "Commands: run, build, new, fmt, test"
+;;
+*)
+echo "unknown command: $cmd" >&2
+exit 1
+;;
+esac
