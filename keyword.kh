@@ -1,0 +1,2 @@
+if, else, match, case, let, var, fn, return, struct, enum, import, export,
+mod, pub, const, mut, trait, impl, for, while, break, continue, async, await
