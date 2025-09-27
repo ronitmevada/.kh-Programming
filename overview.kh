@@ -1,0 +1,17 @@
+#overview.kh
+
+
+
+".kh Programming" (hereafter: .kh) is a compiled (or optionally bytecode-interpreted) language that blends strong static typing with ergonomic syntax influenced by modern languages (Rust, Swift, TypeScript, Kotlin). The goal: make the language feel unique and carefully designed for developer-facing clarity and expressive power.
+
+#Key selling points:
+
+1)Concise, readable syntax with significant whitespace optionality
+
+2)Statically typed with local type inference
+
+3)First-class pattern matching, algebraic data types
+
+4)Simple, pluggable bytecode virtual machine for rapid prototyping
+
+5)Clear module system and package manag
