@@ -1,2 +1,1 @@
-# .kh-Programming
-language For AI training
+##✨ .kh Programming Language ✨
