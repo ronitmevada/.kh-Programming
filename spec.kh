@@ -1,0 +1,19 @@
+# .kh Language Specification 
+
+
+## Lexical
+- Line comments: `//`
+- Block comments: `/* ... */` (nesting allowed)
+- Strings: `"..."`, raw `r"..."`
+- Interpolation: `"hello ${name}"`
+
+
+## Types
+Primitives: `Int`, `Float`, `Bool`, `String`, `Char`, `Unit`
+
+
+## Functions
+```kh
+fn add(a: Int, b: Int) -> Int {
+a + b
+}
