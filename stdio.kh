@@ -1,0 +1,7 @@
+// lib/std/io.kh
+pub fn println(s: String) -> Unit {
+// runtime-provided; here for type/preview only
+}
+
+
+pub fn print(s: String) -> Unit { }
