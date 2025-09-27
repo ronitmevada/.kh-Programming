@@ -1,0 +1,24 @@
+---
+
+
+## 6) docs/bytecode.md (header + sample opcodes)
+```text
+.kh bytecode quick reference
+
+
+Header: 4 bytes magic ".kh!" (0x2E6B6821), u16 version_major, u16 version_minor
+
+
+Sample opcodes:
+0x01 LOAD_CONST <u32>
+0x02 LOAD_LOCAL <u16>
+0x03 STORE_LOCAL <u16>
+0x04 ADD
+0x05 SUB
+0x06 MUL
+0x07 DIV
+0x0A CALL <u32> <u8>
+0x0F RETURN
+
+
+All integers little-endian. Section table and constant pool follow header.
