@@ -1,0 +1,22 @@
+// examples/http_server.kh
+// NOTE: this example assumes std.net exists. It's illustrative only.
+import std.net as net
+import std.io as io
+
+
+pub fn handle_conn(conn) {
+io.println("New connection");
+// naive pseudo-handling
+conn.write("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nHello from .kh\n");
+conn.close();
+}
+
+
+pub fn main() -> Int {
+let listener = net.TcpListener::bind("127.0.0.1:8080");
+io.println("listening on 127.0.0.1:8080");
+for c in listener.incoming() {
+spawn fn() { handle_conn(c); }
+}
+return 0;
+}
